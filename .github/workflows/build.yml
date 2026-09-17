@@ -1,16 +1,26 @@
-name: Build Valheim Modpack
+```yaml
+name: Build Valheim Standalone Modpack
 
 on:
   workflow_dispatch:
+
   push:
     branches:
       - main
 
+    tags:
+      - "v*"
+
 permissions:
   contents: write
 
+env:
+  GAME: valheim
+  THUNDERSTORE_PROFILE_API: https://thunderstore.io/api/experimental/legacyprofile/get
+
 jobs:
   build:
+    name: Build standalone Valheim modpack
     runs-on: ubuntu-latest
 
     steps:
@@ -19,25 +29,35 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -euxo pipefail
+
           sudo apt-get update
+
           sudo apt-get install -y \
             curl \
             jq \
             unzip \
             zip \
-            coreutils
+            python3 \
+            python3-pip
 
-      - name: Read profile code
+          python3 -m pip install --break-system-packages pyyaml
+
+      - name: Read r2modman profile code
         id: profile
         shell: bash
         run: |
+          set -euo pipefail
+
           CODE="$(tr -d '[:space:]' < profile-code.txt)"
 
-          if [ -z "$CODE" ]; then
-            echo "Profile code is empty"
+          if [[ ! "$CODE" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+            echo "ERROR: Invalid r2modman profile code"
+            echo "Got: $CODE"
             exit 1
           fi
 
+          echo "Profile code: $CODE"
           echo "code=$CODE" >> "$GITHUB_OUTPUT"
 
       - name: Download r2modman profile
@@ -46,250 +66,514 @@ jobs:
         run: |
           set -euxo pipefail
 
-          PROFILE_URL="https://thunderstore.io/api/experimental/legacyprofile/get/${PROFILE_CODE}"
+          mkdir -p work
+          mkdir -p pack
 
-          echo "Downloading profile..."
+          URL="${THUNDERSTORE_PROFILE_API}/${PROFILE_CODE}/"
+
+          echo "Downloading r2modman profile..."
 
           curl \
             --fail \
             --location \
-            --retry 5 \
+            --retry 8 \
             --retry-delay 3 \
-            "$PROFILE_URL" \
-            -o profile.txt
+            --connect-timeout 30 \
+            --max-time 120 \
+            "$URL" \
+            -o work/profile-response.txt
 
-          if ! head -n 1 profile.txt | grep -q '#r2modman'; then
-            echo "Downloaded data is not an r2modman profile"
-            cat profile.txt
+          if ! grep -q '^#r2modman' work/profile-response.txt; then
+            echo "ERROR: Invalid r2modman profile response."
+            cat work/profile-response.txt
             exit 1
           fi
 
-          tail -n 1 profile.txt | base64 -d > profile.r2z
+          tail -n 1 work/profile-response.txt \
+            | base64 --decode \
+            > work/profile.r2z
 
-          echo "Profile size:"
-          du -h profile.r2z
+          echo "Downloaded profile:"
+          ls -lh work/profile.r2z
 
       - name: Extract profile
         run: |
           set -euxo pipefail
 
-          mkdir -p profile
+          mkdir -p work/profile
 
-          unzip -q profile.r2z -d profile
+          unzip -q work/profile.r2z -d work/profile
 
           echo "Profile contents:"
-          find profile -maxdepth 3 -type f | sort
+          find work/profile -maxdepth 3 -type f | sort
 
-      - name: Inspect profile
+          test -f work/profile/export.r2x
+
+      - name: Download all profile mods
         run: |
-          set -euxo pipefail
-
-          if [ -f profile/export.r2x ]; then
-            echo "Found export.r2x"
-            cat profile/export.r2x
-          fi
-
-      - name: Download complete modpack
-        run: |
-          set -euxo pipefail
-
-          mkdir -p modpack
-
-          echo "Installing profile contents..."
-
-          if [ -d profile/BepInEx ]; then
-            cp -a profile/BepInEx modpack/
-          fi
-
-          if [ -d profile/config ]; then
-            cp -a profile/config modpack/
-          fi
-
-          if [ -d profile/plugins ]; then
-            cp -a profile/plugins modpack/
-          fi
-
-          echo "Initial profile files:"
-          du -sh modpack || true
-
-      - name: Download mods from profile
-        run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           python3 <<'PY'
-          import json
           import os
-          import re
-          import subprocess
+          import shutil
+          import sys
+          import tempfile
+          import time
           import urllib.request
           import zipfile
           from pathlib import Path
 
-          profile = Path("profile")
+          import yaml
 
-          # Locate export.r2x
-          export_files = list(profile.rglob("export.r2x"))
+          PROFILE = Path("work/profile/export.r2x")
+          PACK = Path("pack")
+          DOWNLOADS = Path("work/downloads")
 
-          if not export_files:
-              print("ERROR: export.r2x was not found")
-              raise SystemExit(1)
+          PACK.mkdir(parents=True, exist_ok=True)
+          DOWNLOADS.mkdir(parents=True, exist_ok=True)
 
-          export_file = export_files[0]
+          with PROFILE.open("r", encoding="utf-8") as f:
+              profile = yaml.safe_load(f)
 
-          print("Using:", export_file)
+          if not isinstance(profile, dict):
+              raise RuntimeError("Invalid export.r2x")
 
-          data = export_file.read_text(errors="ignore")
+          profile_name = profile.get(
+              "profileName",
+              "Valheim Modpack"
+          )
 
-          print("export.r2x:")
-          print(data[:5000])
+          mods = profile.get("mods", [])
 
-          # r2x is normally YAML-like JSON data.
-          # Try JSON first.
-          parsed = None
+          print("=" * 70)
+          print(f"Profile: {profile_name}")
+          print(f"Mods: {len(mods)}")
+          print("=" * 70)
 
-          try:
-              parsed = json.loads(data)
-          except Exception:
-              pass
+          if not mods:
+              raise RuntimeError(
+                  "No mods were found in the profile."
+              )
 
-          if parsed is None:
-              print("Could not parse export.r2x as JSON.")
-              print("The profile archive itself will still be preserved.")
-              raise SystemExit(0)
+          def download(url, retries=8):
+              last_error = None
 
-          mods = parsed.get("mods", [])
+              for attempt in range(1, retries + 1):
+                  try:
+                      request = urllib.request.Request(
+                          url,
+                          headers={
+                              "User-Agent":
+                              "GitHubActions-Valheim-ModpackBuilder/1.0"
+                          }
+                      )
 
-          print("Mods in profile:", len(mods))
+                      with urllib.request.urlopen(
+                          request,
+                          timeout=120
+                      ) as response:
+                          return response.read()
 
-          download_dir = Path("mod-downloads")
-          download_dir.mkdir(exist_ok=True)
+                  except Exception as e:
+                      last_error = e
 
-          for mod in mods:
-              name = mod.get("name")
-              version = mod.get("version", {})
+                      print(
+                          f"Download failed "
+                          f"({attempt}/{retries}): {e}"
+                      )
+
+                      if attempt < retries:
+                          time.sleep(
+                              min(attempt * 3, 20)
+                          )
+
+              raise RuntimeError(
+                  f"Download failed: {url}\n"
+                  f"{last_error}"
+              )
+
+          def safe_extract(zip_file, destination):
+              destination = Path(destination).resolve()
+
+              for member in zip_file.infolist():
+                  target = (
+                      destination / member.filename
+                  ).resolve()
+
+                  if (
+                      not str(target).startswith(
+                          str(destination) + os.sep
+                      )
+                      and target != destination
+                  ):
+                      raise RuntimeError(
+                          f"Unsafe ZIP path: "
+                          f"{member.filename}"
+                      )
+
+              zip_file.extractall(destination)
+
+          def merge_tree(source, destination):
+              source = Path(source)
+              destination = Path(destination)
+
+              destination.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
+
+              for item in source.iterdir():
+                  target = destination / item.name
+
+                  if item.is_dir():
+                      merge_tree(item, target)
+                  else:
+                      target.parent.mkdir(
+                          parents=True,
+                          exist_ok=True
+                      )
+
+                      shutil.copy2(
+                          item,
+                          target
+                      )
+
+          def install_package(package_zip):
+              temp = Path(
+                  tempfile.mkdtemp(
+                      prefix="valheim-mod-"
+                  )
+              )
+
+              try:
+                  with zipfile.ZipFile(package_zip) as zf:
+                      safe_extract(
+                          zf,
+                          temp
+                      )
+
+                  if (temp / "BepInEx").is_dir():
+                      merge_tree(
+                          temp / "BepInEx",
+                          PACK / "BepInEx"
+                      )
+
+                      return
+
+                  subdirs = (
+                      "plugins",
+                      "patchers",
+                      "core",
+                      "monomod"
+                  )
+
+                  if any(
+                      (temp / d).is_dir()
+                      for d in subdirs
+                  ):
+                      merge_tree(
+                          temp,
+                          PACK / "BepInEx"
+                      )
+
+                      return
+
+                  directories = [
+                      p for p in temp.iterdir()
+                      if p.is_dir()
+                  ]
+
+                  for directory in directories:
+                      if (
+                          (directory / "BepInEx").is_dir()
+                          or any(
+                              (directory / d).is_dir()
+                              for d in subdirs
+                          )
+                      ):
+                          if (
+                              directory / "BepInEx"
+                          ).is_dir():
+                              merge_tree(
+                                  directory / "BepInEx",
+                                  PACK / "BepInEx"
+                              )
+                          else:
+                              merge_tree(
+                                  directory,
+                                  PACK / "BepInEx"
+                              )
+
+                          return
+
+                  merge_tree(
+                      temp,
+                      PACK
+                  )
+
+              finally:
+                  shutil.rmtree(
+                      temp,
+                      ignore_errors=True
+                  )
+
+          for index, mod in enumerate(
+              mods,
+              start=1
+          ):
+              if not isinstance(mod, dict):
+                  print(
+                      f"Skipping malformed mod: {mod}"
+                  )
+                  continue
+
+              name = str(
+                  mod.get("name", "")
+              ).strip()
+
+              version = mod.get(
+                  "version",
+                  {}
+              )
 
               if not name:
+                  print(
+                      "Skipping mod without name"
+                  )
                   continue
 
-              major = version.get("major")
-              minor = version.get("minor")
-              patch = version.get("patch")
+              try:
+                  major = int(
+                      version["major"]
+                  )
 
-              if major is None or minor is None or patch is None:
-                  print("Skipping malformed mod:", mod)
-                  continue
+                  minor = int(
+                      version["minor"]
+                  )
 
-              version_string = f"{major}.{minor}.{patch}"
+                  patch = int(
+                      version["patch"]
+                  )
 
-              # Thunderstore dependency format:
-              # Author-ModName-Version
+              except Exception:
+                  raise RuntimeError(
+                      f"Invalid version for {name}: "
+                      f"{version}"
+                  )
+
+              version_string = (
+                  f"{major}.{minor}.{patch}"
+              )
+
               parts = name.split("-", 1)
 
               if len(parts) != 2:
-                  print("Skipping:", name)
-                  continue
+                  raise RuntimeError(
+                      f"Invalid Thunderstore package: "
+                      f"{name}"
+                  )
 
               author, package = parts
 
               url = (
-                  "https://thunderstore.io/package/download/"
-                  f"{author}/{package}/{version_string}/"
+                  "https://thunderstore.io/"
+                  "package/download/"
+                  f"{author}/{package}/"
+                  f"{version_string}/"
               )
 
-              filename = download_dir / f"{author}-{package}-{version_string}.zip"
+              filename = (
+                  DOWNLOADS
+                  / (
+                      f"{author}-"
+                      f"{package}-"
+                      f"{version_string}.zip"
+                  )
+              )
 
               print()
-              print("Downloading:", name, version_string)
-              print("URL:", url)
+              print(
+                  f"[{index}/{len(mods)}] "
+                  f"{name} {version_string}"
+              )
 
-              try:
-                  urllib.request.urlretrieve(url, filename)
-              except Exception as e:
-                  print("FAILED:", e)
-                  raise
+              data = download(url)
 
-              print("Downloaded:", filename)
+              filename.write_bytes(data)
+
+              print(
+                  f"Downloaded "
+                  f"{filename.stat().st_size / "
+                  "1024 / 1024:.2f} MB"
+              )
+
+              install_package(filename)
+
+          # Copy profile-specific BepInEx files.
+          profile_root = Path(
+              "work/profile"
+          )
+
+          if (
+              profile_root / "BepInEx"
+          ).is_dir():
+              merge_tree(
+                  profile_root / "BepInEx",
+                  PACK / "BepInEx"
+              )
+
+          if (
+              profile_root / "config"
+          ).is_dir():
+              merge_tree(
+                  profile_root / "config",
+                  PACK / "BepInEx" / "config"
+              )
+
+          print()
+          print("=" * 70)
+          print("Standalone pack assembled")
+          print("=" * 70)
+
+          files = [
+              p for p in PACK.rglob("*")
+              if p.is_file()
+          ]
+
+          size = sum(
+              p.stat().st_size
+              for p in files
+          )
+
+          print(
+              f"Files: {len(files)}"
+          )
+
+          print(
+              f"Size: "
+              f"{size / 1024 / 1024:.2f} MB"
+          )
           PY
 
-      - name: Extract downloaded mods
+      - name: Verify standalone pack
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
-          mkdir -p modpack
+          test -d pack/BepInEx
 
-          for archive in mod-downloads/*.zip; do
-            [ -e "$archive" ] || continue
+          echo "Pack size:"
+          du -sh pack
 
-            echo "Installing $(basename "$archive")"
+          echo
+          echo "BepInEx:"
+          find pack/BepInEx \
+            -maxdepth 2 \
+            -type d \
+            | sort
 
-            mkdir -p .tmp-mod
-
-            rm -rf .tmp-mod/*
-            unzip -q "$archive" -d .tmp-mod
-
-            # Thunderstore packages may contain a BepInEx directory.
-            if [ -d ".tmp-mod/BepInEx" ]; then
-              cp -a .tmp-mod/BepInEx/. modpack/ || true
-            else
-              # Profile packages generally need their files merged
-              # into the profile directory.
-              cp -a .tmp-mod/. modpack/ || true
-            fi
-          done
-
-      - name: Create modpack information
+      - name: Generate pack information
         run: |
-          cat > modpack/README.txt <<EOF
-          Valheim Thunderstore / r2modman Modpack
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="build-${GITHUB_RUN_NUMBER}"
+          fi
+
+          cat > pack/VALHEIM-MODPACK.txt <<EOF
+          Valheim Standalone Modpack
 
           Profile code:
           ${{ steps.profile.outputs.code }}
 
-          Generated by GitHub Actions.
+          Version:
+          ${VERSION}
 
-          This archive contains the downloaded profile/mod files.
+          Git commit:
+          ${GITHUB_SHA}
+
+          GitHub Actions run:
+          ${GITHUB_RUN_NUMBER}
+
+          Generated:
+          $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+          Installation:
+
+          1. Install Valheim.
+          2. Extract this archive into the Valheim directory.
+          3. Launch Valheim through BepInEx.
+
+          This archive contains the downloaded
+          Thunderstore mod files and profile configuration.
           EOF
 
-      - name: Show final size
+      - name: Create standalone ZIP
+        id: zip
         run: |
-          echo "Final modpack:"
-          du -sh modpack
-
-          echo
-          echo "Files:"
-          find modpack -type f | wc -l
-
-      - name: Create ZIP
-        run: |
-          set -euxo pipefail
-
-          VERSION="${GITHUB_RUN_NUMBER}"
+          set -euo pipefail
 
           mkdir -p release
 
-          cd modpack
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="build-${GITHUB_RUN_NUMBER}"
+          fi
+
+          ZIP="Valheim-Standalone-Modpack-${VERSION}.zip"
+
+          echo "Creating ${ZIP}"
+
+          cd pack
 
           zip \
             -r \
             -9 \
-            "../release/Valheim-Modpack-${VERSION}.zip" \
+            "../release/${ZIP}" \
             .
 
           cd ..
 
-          ls -lh release/
+          echo "zip=${ZIP}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload ZIP artifact
+          echo
+          echo "Final archive:"
+          ls -lh "release/${ZIP}"
+
+      # ------------------------------------------------------------
+      # Every build gets an Actions artifact.
+      # This does NOT create a GitHub Release.
+      # ------------------------------------------------------------
+      - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Valheim-Modpack
-          path: release/Valheim-Modpack-*.zip
+          name: Valheim-Standalone-Modpack-${{ steps.zip.outputs.version }}
+          path: release/*.zip
           compression-level: 0
+          if-no-files-found: error
           retention-days: 30
 
+      # ------------------------------------------------------------
+      # RELEASES ARE TAG ONLY.
+      #
+      # main push:
+      #   NO RELEASE
+      #
+      # v1.0.0 tag:
+      #   CREATE RELEASE
+      # ------------------------------------------------------------
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: release/Valheim-Modpack-*.zip
+          tag_name: ${{ github.ref_name }}
+          name: "Valheim Modpack ${{ github.ref_name }}"
           generate_release_notes: true
+          files: |
+            release/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
