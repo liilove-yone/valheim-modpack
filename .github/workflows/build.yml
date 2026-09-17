@@ -1,4 +1,4 @@
-```yaml
+
 name: Build Valheim Standalone Modpack
 
 on:
@@ -576,4 +576,3 @@ jobs:
             release/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-```
