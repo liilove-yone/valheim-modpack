@@ -1,4 +1,4 @@
-
+```yaml
 name: Build Valheim Standalone Modpack
 
 on:
@@ -7,7 +7,6 @@ on:
   push:
     branches:
       - main
-
     tags:
       - "v*"
 
@@ -72,6 +71,7 @@ jobs:
           URL="${THUNDERSTORE_PROFILE_API}/${PROFILE_CODE}/"
 
           echo "Downloading r2modman profile..."
+          echo "$URL"
 
           curl \
             --fail \
@@ -84,16 +84,19 @@ jobs:
             -o work/profile-response.txt
 
           if ! grep -q '^#r2modman' work/profile-response.txt; then
-            echo "ERROR: Invalid r2modman profile response."
+            echo "ERROR: Thunderstore did not return an r2modman profile."
+            echo
             cat work/profile-response.txt
             exit 1
           fi
+
+          echo "Profile received."
 
           tail -n 1 work/profile-response.txt \
             | base64 --decode \
             > work/profile.r2z
 
-          echo "Downloaded profile:"
+          echo "Profile archive:"
           ls -lh work/profile.r2z
 
       - name: Extract profile
@@ -105,9 +108,16 @@ jobs:
           unzip -q work/profile.r2z -d work/profile
 
           echo "Profile contents:"
-          find work/profile -maxdepth 3 -type f | sort
+          find work/profile -maxdepth 3 -type f -print | sort
 
-          test -f work/profile/export.r2x
+          if [[ ! -f work/profile/export.r2x ]]; then
+            echo "ERROR: export.r2x was not found."
+            exit 1
+          fi
+
+          echo
+          echo "export.r2x:"
+          cat work/profile/export.r2x
 
       - name: Download all profile mods
         run: |
@@ -132,6 +142,10 @@ jobs:
           PACK.mkdir(parents=True, exist_ok=True)
           DOWNLOADS.mkdir(parents=True, exist_ok=True)
 
+          print("=" * 70)
+          print("Reading r2modman profile")
+          print("=" * 70)
+
           with PROFILE.open("r", encoding="utf-8") as f:
               profile = yaml.safe_load(f)
 
@@ -145,10 +159,9 @@ jobs:
 
           mods = profile.get("mods", [])
 
-          print("=" * 70)
           print(f"Profile: {profile_name}")
-          print(f"Mods: {len(mods)}")
-          print("=" * 70)
+          print(f"Mods listed: {len(mods)}")
+          print()
 
           if not mods:
               raise RuntimeError(
@@ -164,7 +177,7 @@ jobs:
                           url,
                           headers={
                               "User-Agent":
-                              "GitHubActions-Valheim-ModpackBuilder/1.0"
+                                  "GitHubActions-Valheim-ModpackBuilder/1.0"
                           }
                       )
 
@@ -252,14 +265,16 @@ jobs:
                           temp
                       )
 
+                  # Package contains BepInEx directly.
                   if (temp / "BepInEx").is_dir():
+                      print("  Layout: BepInEx/")
                       merge_tree(
                           temp / "BepInEx",
                           PACK / "BepInEx"
                       )
-
                       return
 
+                  # Package contains BepInEx subdirectories directly.
                   subdirs = (
                       "plugins",
                       "patchers",
@@ -271,31 +286,43 @@ jobs:
                       (temp / d).is_dir()
                       for d in subdirs
                   ):
+                      print(
+                          "  Layout: BepInEx subdirectories"
+                      )
+
                       merge_tree(
                           temp,
                           PACK / "BepInEx"
                       )
-
                       return
 
+                  # Look for a nested package directory.
                   directories = [
                       p for p in temp.iterdir()
                       if p.is_dir()
                   ]
 
                   for directory in directories:
+                      nested_bepinex = (
+                          directory / "BepInEx"
+                      )
+
+                      nested_layout = any(
+                          (directory / d).is_dir()
+                          for d in subdirs
+                      )
+
                       if (
-                          (directory / "BepInEx").is_dir()
-                          or any(
-                              (directory / d).is_dir()
-                              for d in subdirs
-                          )
+                          nested_bepinex.is_dir()
+                          or nested_layout
                       ):
-                          if (
-                              directory / "BepInEx"
-                          ).is_dir():
+                          print(
+                              "  Layout: nested package"
+                          )
+
+                          if nested_bepinex.is_dir():
                               merge_tree(
-                                  directory / "BepInEx",
+                                  nested_bepinex,
                                   PACK / "BepInEx"
                               )
                           else:
@@ -305,6 +332,9 @@ jobs:
                               )
 
                           return
+
+                  # Otherwise copy package root.
+                  print("  Layout: package root")
 
                   merge_tree(
                       temp,
@@ -316,6 +346,8 @@ jobs:
                       temp,
                       ignore_errors=True
                   )
+
+          total = len(mods)
 
           for index, mod in enumerate(
               mods,
@@ -342,19 +374,15 @@ jobs:
                   )
                   continue
 
+              if not isinstance(version, dict):
+                  raise RuntimeError(
+                      f"Invalid version for {name}"
+                  )
+
               try:
-                  major = int(
-                      version["major"]
-                  )
-
-                  minor = int(
-                      version["minor"]
-                  )
-
-                  patch = int(
-                      version["patch"]
-                  )
-
+                  major = int(version["major"])
+                  minor = int(version["minor"])
+                  patch = int(version["patch"])
               except Exception:
                   raise RuntimeError(
                       f"Invalid version for {name}: "
@@ -383,8 +411,8 @@ jobs:
               )
 
               filename = (
-                  DOWNLOADS
-                  / (
+                  DOWNLOADS /
+                  (
                       f"{author}-"
                       f"{package}-"
                       f"{version_string}.zip"
@@ -392,24 +420,36 @@ jobs:
               )
 
               print()
+              print("=" * 70)
               print(
-                  f"[{index}/{len(mods)}] "
+                  f"[{index}/{total}] "
                   f"{name} {version_string}"
               )
+              print(f"URL: {url}")
+              print("=" * 70)
 
               data = download(url)
 
               filename.write_bytes(data)
 
+              size_mb = (
+                  filename.stat().st_size
+                  / (1024 * 1024)
+              )
+
               print(
-                  f"Downloaded "
-                  f"{filename.stat().st_size / "
-                  "1024 / 1024:.2f} MB"
+                  f"Downloaded: "
+                  f"{size_mb:.2f} MB"
               )
 
               install_package(filename)
 
-          # Copy profile-specific BepInEx files.
+          # Copy profile-specific files.
+          print()
+          print("=" * 70)
+          print("Copying profile-specific files")
+          print("=" * 70)
+
           profile_root = Path(
               "work/profile"
           )
@@ -436,40 +476,51 @@ jobs:
           print("=" * 70)
 
           files = [
-              p for p in PACK.rglob("*")
+              p
+              for p in PACK.rglob("*")
               if p.is_file()
           ]
 
-          size = sum(
+          total_size = sum(
               p.stat().st_size
               for p in files
           )
 
-          print(
-              f"Files: {len(files)}"
+          total_mb = (
+              total_size
+              / (1024 * 1024)
           )
 
-          print(
-              f"Size: "
-              f"{size / 1024 / 1024:.2f} MB"
-          )
+          print(f"Files: {len(files)}")
+          print(f"Size: {total_mb:.2f} MB")
+          print(f"Profile: {profile_name}")
           PY
 
       - name: Verify standalone pack
         run: |
           set -euo pipefail
 
-          test -d pack/BepInEx
-
           echo "Pack size:"
           du -sh pack
 
           echo
-          echo "BepInEx:"
-          find pack/BepInEx \
-            -maxdepth 2 \
-            -type d \
-            | sort
+          echo "Pack structure:"
+          find pack -maxdepth 4 -type f | sort | head -200
+
+          echo
+          echo "Checking BepInEx..."
+
+          test -d pack/BepInEx
+
+          echo "BepInEx: OK"
+
+          if [[ -d pack/BepInEx/plugins ]]; then
+            echo "BepInEx/plugins: OK"
+          fi
+
+          if [[ -d pack/BepInEx/config ]]; then
+            echo "BepInEx/config: OK"
+          fi
 
       - name: Generate pack information
         run: |
@@ -502,7 +553,7 @@ jobs:
           Installation:
 
           1. Install Valheim.
-          2. Extract this archive into the Valheim directory.
+          2. Extract this archive into the Valheim game directory.
           3. Launch Valheim through BepInEx.
 
           This archive contains the downloaded
@@ -536,17 +587,16 @@ jobs:
 
           cd ..
 
+          SIZE=$(stat -c%s "release/${ZIP}")
+
           echo "zip=${ZIP}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "size=${SIZE}" >> "$GITHUB_OUTPUT"
 
           echo
-          echo "Final archive:"
+          echo "Final ZIP:"
           ls -lh "release/${ZIP}"
 
-      # ------------------------------------------------------------
-      # Every build gets an Actions artifact.
-      # This does NOT create a GitHub Release.
-      # ------------------------------------------------------------
       - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
@@ -557,13 +607,9 @@ jobs:
           retention-days: 30
 
       # ------------------------------------------------------------
-      # RELEASES ARE TAG ONLY.
-      #
-      # main push:
-      #   NO RELEASE
-      #
-      # v1.0.0 tag:
-      #   CREATE RELEASE
+      # GitHub Releases are TAG ONLY.
+      # main push -> artifact only
+      # v1.0.0 tag -> artifact + GitHub Release
       # ------------------------------------------------------------
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -576,3 +622,4 @@ jobs:
             release/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
