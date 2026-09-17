@@ -1,0 +1,295 @@
+name: Build Valheim Modpack
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            jq \
+            unzip \
+            zip \
+            coreutils
+
+      - name: Read profile code
+        id: profile
+        shell: bash
+        run: |
+          CODE="$(tr -d '[:space:]' < profile-code.txt)"
+
+          if [ -z "$CODE" ]; then
+            echo "Profile code is empty"
+            exit 1
+          fi
+
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+
+      - name: Download r2modman profile
+        env:
+          PROFILE_CODE: ${{ steps.profile.outputs.code }}
+        run: |
+          set -euxo pipefail
+
+          PROFILE_URL="https://thunderstore.io/api/experimental/legacyprofile/get/${PROFILE_CODE}"
+
+          echo "Downloading profile..."
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 3 \
+            "$PROFILE_URL" \
+            -o profile.txt
+
+          if ! head -n 1 profile.txt | grep -q '#r2modman'; then
+            echo "Downloaded data is not an r2modman profile"
+            cat profile.txt
+            exit 1
+          fi
+
+          tail -n 1 profile.txt | base64 -d > profile.r2z
+
+          echo "Profile size:"
+          du -h profile.r2z
+
+      - name: Extract profile
+        run: |
+          set -euxo pipefail
+
+          mkdir -p profile
+
+          unzip -q profile.r2z -d profile
+
+          echo "Profile contents:"
+          find profile -maxdepth 3 -type f | sort
+
+      - name: Inspect profile
+        run: |
+          set -euxo pipefail
+
+          if [ -f profile/export.r2x ]; then
+            echo "Found export.r2x"
+            cat profile/export.r2x
+          fi
+
+      - name: Download complete modpack
+        run: |
+          set -euxo pipefail
+
+          mkdir -p modpack
+
+          echo "Installing profile contents..."
+
+          if [ -d profile/BepInEx ]; then
+            cp -a profile/BepInEx modpack/
+          fi
+
+          if [ -d profile/config ]; then
+            cp -a profile/config modpack/
+          fi
+
+          if [ -d profile/plugins ]; then
+            cp -a profile/plugins modpack/
+          fi
+
+          echo "Initial profile files:"
+          du -sh modpack || true
+
+      - name: Download mods from profile
+        run: |
+          set -euxo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          profile = Path("profile")
+
+          # Locate export.r2x
+          export_files = list(profile.rglob("export.r2x"))
+
+          if not export_files:
+              print("ERROR: export.r2x was not found")
+              raise SystemExit(1)
+
+          export_file = export_files[0]
+
+          print("Using:", export_file)
+
+          data = export_file.read_text(errors="ignore")
+
+          print("export.r2x:")
+          print(data[:5000])
+
+          # r2x is normally YAML-like JSON data.
+          # Try JSON first.
+          parsed = None
+
+          try:
+              parsed = json.loads(data)
+          except Exception:
+              pass
+
+          if parsed is None:
+              print("Could not parse export.r2x as JSON.")
+              print("The profile archive itself will still be preserved.")
+              raise SystemExit(0)
+
+          mods = parsed.get("mods", [])
+
+          print("Mods in profile:", len(mods))
+
+          download_dir = Path("mod-downloads")
+          download_dir.mkdir(exist_ok=True)
+
+          for mod in mods:
+              name = mod.get("name")
+              version = mod.get("version", {})
+
+              if not name:
+                  continue
+
+              major = version.get("major")
+              minor = version.get("minor")
+              patch = version.get("patch")
+
+              if major is None or minor is None or patch is None:
+                  print("Skipping malformed mod:", mod)
+                  continue
+
+              version_string = f"{major}.{minor}.{patch}"
+
+              # Thunderstore dependency format:
+              # Author-ModName-Version
+              parts = name.split("-", 1)
+
+              if len(parts) != 2:
+                  print("Skipping:", name)
+                  continue
+
+              author, package = parts
+
+              url = (
+                  "https://thunderstore.io/package/download/"
+                  f"{author}/{package}/{version_string}/"
+              )
+
+              filename = download_dir / f"{author}-{package}-{version_string}.zip"
+
+              print()
+              print("Downloading:", name, version_string)
+              print("URL:", url)
+
+              try:
+                  urllib.request.urlretrieve(url, filename)
+              except Exception as e:
+                  print("FAILED:", e)
+                  raise
+
+              print("Downloaded:", filename)
+          PY
+
+      - name: Extract downloaded mods
+        run: |
+          set -euxo pipefail
+
+          mkdir -p modpack
+
+          for archive in mod-downloads/*.zip; do
+            [ -e "$archive" ] || continue
+
+            echo "Installing $(basename "$archive")"
+
+            mkdir -p .tmp-mod
+
+            rm -rf .tmp-mod/*
+            unzip -q "$archive" -d .tmp-mod
+
+            # Thunderstore packages may contain a BepInEx directory.
+            if [ -d ".tmp-mod/BepInEx" ]; then
+              cp -a .tmp-mod/BepInEx/. modpack/ || true
+            else
+              # Profile packages generally need their files merged
+              # into the profile directory.
+              cp -a .tmp-mod/. modpack/ || true
+            fi
+          done
+
+      - name: Create modpack information
+        run: |
+          cat > modpack/README.txt <<EOF
+          Valheim Thunderstore / r2modman Modpack
+
+          Profile code:
+          ${{ steps.profile.outputs.code }}
+
+          Generated by GitHub Actions.
+
+          This archive contains the downloaded profile/mod files.
+          EOF
+
+      - name: Show final size
+        run: |
+          echo "Final modpack:"
+          du -sh modpack
+
+          echo
+          echo "Files:"
+          find modpack -type f | wc -l
+
+      - name: Create ZIP
+        run: |
+          set -euxo pipefail
+
+          VERSION="${GITHUB_RUN_NUMBER}"
+
+          mkdir -p release
+
+          cd modpack
+
+          zip \
+            -r \
+            -9 \
+            "../release/Valheim-Modpack-${VERSION}.zip" \
+            .
+
+          cd ..
+
+          ls -lh release/
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Valheim-Modpack
+          path: release/Valheim-Modpack-*.zip
+          compression-level: 0
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/Valheim-Modpack-*.zip
+          generate_release_notes: true
